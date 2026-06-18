@@ -20,9 +20,10 @@ This project continuously monitors indoor environmental conditions — temperatu
 | 🧪 Gas Detection | MQ135 VOC / CO₂ indicator |
 | 🔊 Noise Monitoring | MAX9814 microphone amplifier spike detection |
 | 💡 Visual Alerts | Green / Yellow / Red LED status indicators |
-| 🔔 Hourly Chime | Buzzer notification every hour (3x at 12:00 & 17:00) |
+| 🔔 Hourly Chime | Non-blocking buzzer notification every hour (3x at 12:00 & 17:00) |
 | 🌬️ Auto Ventilation | Fan relay triggered every 3 minutes for 5 seconds |
-| 🕐 Real-Time Clock | DS1302 RTC module for accurate timekeeping |
+| 🕐 Real-Time Clock | DS1302 RTC module with battery backup |
+| 🐕 Watchdog Timer | 8-second hardware watchdog auto-recovers from system hangs |
 | 📊 Live Dashboard | Grafana + InfluxDB time-series visualization |
 | 📡 Data Pipeline | Arduino → Node-RED → InfluxDB → Grafana |
 
@@ -39,8 +40,8 @@ This project continuously monitors indoor environmental conditions — temperatu
 | Dust Sensor | SDS011 | PM2.5 & PM10 measurement |
 | Gas Sensor | MQ135 | VOC / CO₂ detection |
 | Microphone | MAX9814 | Noise level monitoring |
-| Clock Module | DS1302 | Real-time clock |
-| Display | 16×2 I2C LCD | Local data display |
+| Clock Module | DS1302 | Real-time clock with battery |
+| Display | 16×2 I2C LCD (0x27) | Local data display |
 | Relay | 5V Single Channel | Fan control |
 | Fan | 5V DC Mini Fan | Auto ventilation |
 | LEDs | Red / Yellow / Green | Alert indicators |
@@ -173,25 +174,28 @@ The Arduino sends a JSON payload once per minute over Serial (115200 baud):
 ## ⏰ Alert Schedule
 
 ```
-Every hour  (XX:00)  → 1× 500ms beep + all LEDs flash
-12:00 & 17:00        → 3× 500ms beeps + all LEDs flash
-ALARM state          → 1× beep on trigger, Red LED stays on
+Every hour  (XX:00)  → 1× 500ms beep + all LEDs flash  (non-blocking)
+12:00 & 17:00        → 3× 500ms beeps + all LEDs flash  (non-blocking)
+ALARM state          → 1× 500ms beep on trigger, Red LED stays on
 Fan                  → Runs 5 seconds every 3 minutes
+Heartbeat            → "ALIVE HH:MM:SS" printed to Serial every 10 seconds
 ```
 
 ---
 
 ## 🖥️ LCD Display
 
-The 16×2 LCD alternates between two screens every 2 seconds:
+The 16×2 LCD rotates through three screens every 2 seconds:
 
 ```
-Screen 1:                    Screen 2:
-┌────────────────┐           ┌────────────────┐
-│T:22.4C H: 45%  │           │   14:32:05     │
-│AQI:31  FAN:OFF │           │PM:7.3  10:11.8 │
-└────────────────┘           └────────────────┘
+Screen 1:                 Screen 2:              Screen 3:
+┌────────────────┐        ┌────────────────┐     ┌────────────────┐
+│T:22.4C H: 45%  │        │   14:32:05     │     │PM2.5:  7.3 ug/m3│
+│AQI:31  FAN:OFF │        │                │     │PM10:  11.8 ug/m3│
+└────────────────┘        └────────────────┘     └────────────────┘
 ```
+
+> LCD updates are paused during SDS011 measurement and fan operation to prevent I2C interference.
 
 ---
 
@@ -219,6 +223,8 @@ try {
     return null;
 }
 ```
+
+> Lines not starting with `{` (e.g. `ALIVE`, `RESET=`) are automatically discarded.
 
 ---
 
@@ -257,23 +263,25 @@ services:
 ### Temperature
 ```flux
 from(bucket: "smart_room")
-  |> range(start: -1h)
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
   |> filter(fn: (r) => r._measurement == "aqi")
   |> filter(fn: (r) => r._field == "temp")
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
 ```
 
 ### PM2.5 & PM10
 ```flux
 from(bucket: "smart_room")
-  |> range(start: -1h)
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
   |> filter(fn: (r) => r._measurement == "aqi")
   |> filter(fn: (r) => r._field == "pm25" or r._field == "pm10")
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
 ```
 
 ### AQI Gauge
 ```flux
 from(bucket: "smart_room")
-  |> range(start: -1h)
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
   |> filter(fn: (r) => r._measurement == "aqi")
   |> filter(fn: (r) => r._field == "aqi")
   |> last()
@@ -285,9 +293,10 @@ from(bucket: "smart_room")
 
 - **MQ135** requires 24–48 hours warm-up for stable readings. Initial values may be inaccurate.
 - **DHT11** has ±2°C and ±5% RH tolerance. A fixed offset is applied in firmware.
-- **Software clock** (millis-based) resets on power loss. DS1302 with battery maintains time across resets.
-- **SoftwareSerial** may cause minor timing interference with I2C on Arduino Uno.
-- **Watchdog timer** (8s) automatically recovers from system hangs.
+- **DS1302** low-cost clones may drift over time. Battery maintains time across power cycles.
+- **SoftwareSerial + I2C** can cause interrupt conflicts on Arduino Uno. LCD and sensor reads are paused during SDS011 active phases and fan operation to mitigate this.
+- **Watchdog timer** (8s) automatically recovers from system hangs. Reset cause is logged to Serial on boot (`RESET=1` power-on, `RESET=10` brownout, `RESET=100` watchdog).
+- **Fan relay** triggers only when SDS011 is idle to prevent power spike interference.
 
 ---
 
@@ -296,7 +305,7 @@ from(bucket: "smart_room")
 ```
 smart-room-aqi/
 ├── firmware/
-│   └── smart_room_aqi.ino     # Arduino firmware v4.0
+│   └── smart_room_aqi.ino     # Arduino firmware v4.1
 ├── nodered/
 │   └── flows.json             # Node-RED flow export
 ├── grafana/
